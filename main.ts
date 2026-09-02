@@ -20,6 +20,8 @@ const SETTLE_MS = 160;
 const SPLASH_MS = 550;
 const START_STONE_WIDTH = 74;
 const BEST_KEY = "far-bank-best";
+const HISTORY_KEY = "far-bank-history";
+const MAX_HISTORY = 8;
 const SPRITE_COUNT = 9;
 /** Frame index (1-based, into squirrel-N.png) for each phase. A single held
  *  pose for the hop reads as a jump; cycling frames mid-arc looked like a
@@ -48,6 +50,23 @@ function saveBest(value: number): void {
   }
 }
 
+function loadHistory(): number[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem(HISTORY_KEY) ?? "[]");
+    return Array.isArray(raw) ? raw.filter((n) => typeof n === "number") : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveHistory(history: number[]): void {
+  try {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+  } catch {
+    // storage unavailable (private browsing) --- the run still plays fine
+  }
+}
+
 function easeInOutQuad(t: number): number {
   return t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2;
 }
@@ -59,11 +78,15 @@ function easeOutCubic(t: number): number {
 class FarBank {
   private readonly ctx: CanvasRenderingContext2D;
   private readonly scoreEl: HTMLElement;
+  private readonly historyEl: HTMLElement;
   private readonly reducedMotion: boolean;
 
   private phase: Phase = "ready";
   private score = 0;
   private best = loadBest();
+  /** Most recent run first, capped at MAX_HISTORY --- persisted so a reload
+   *  doesn't lose the record of prior attempts. */
+  private history = loadHistory();
 
   private currentStoneWorldX = 0;
   private currentStoneWidth = START_STONE_WIDTH;
@@ -122,11 +145,13 @@ class FarBank {
   constructor(
     private readonly canvas: HTMLCanvasElement,
     scoreEl: HTMLElement,
+    historyEl: HTMLElement,
   ) {
     const ctx = canvas.getContext("2d");
     if (!ctx) throw new Error("2D canvas context unavailable");
     this.ctx = ctx;
     this.scoreEl = scoreEl;
+    this.historyEl = historyEl;
     this.reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
     this.background.addEventListener("load", () => {
       this.backgroundLoaded = true;
@@ -142,6 +167,7 @@ class FarBank {
       this.sprites[i] = img;
     }
     this.updateScoreText();
+    this.renderHistory();
   }
 
   private duration(ms: number): number {
@@ -155,6 +181,25 @@ class FarBank {
         : `Score ${this.score}`;
   }
 
+  /** Called once per run, the moment it ends in the water --- prepends this
+   *  run's score to the persisted history and re-renders the list. */
+  private recordRun(): void {
+    this.history.unshift(this.score);
+    this.history.length = Math.min(this.history.length, MAX_HISTORY);
+    saveHistory(this.history);
+    this.renderHistory();
+  }
+
+  private renderHistory(): void {
+    this.historyEl.replaceChildren(
+      ...this.history.map((score) => {
+        const li = document.createElement("li");
+        li.textContent = `Score ${score}`;
+        return li;
+      }),
+    );
+  }
+
   /** `virtualX` is the press point in canvas (virtual) units --- present for
    *  a pointer press, absent for a keyboard (spacebar) press. Its presence
    *  picks the charge mode: a pointer press charges by drag distance in
@@ -162,7 +207,13 @@ class FarBank {
    *  original hold-duration charge, since there's no cursor position to
    *  drag from. */
   press(now: number, virtualX?: number): void {
-    if (this.phase === "gameover") this.reset();
+    // A click on the game-over screen only restarts the run --- it shouldn't
+    // also arm a charge from that same press, which read as an instant jump
+    // straight into the water.
+    if (this.phase === "gameover") {
+      this.reset();
+      return;
+    }
     if (this.phase !== "ready") return;
     this.phase = "charging";
     this.chargeStart = now;
@@ -239,6 +290,7 @@ class FarBank {
         } else {
           this.splashStart = now;
           this.phase = "splash";
+          this.recordRun();
         }
         this.updateScoreText();
       }
@@ -439,9 +491,10 @@ class FarBank {
 function main(): void {
   const canvas = document.querySelector<HTMLCanvasElement>("#stage");
   const scoreEl = document.querySelector<HTMLElement>("#score");
-  if (!canvas || !scoreEl) return;
+  const historyEl = document.querySelector<HTMLElement>("#history-list");
+  if (!canvas || !scoreEl || !historyEl) return;
 
-  const game = new FarBank(canvas, scoreEl);
+  const game = new FarBank(canvas, scoreEl, historyEl);
 
   function resize(): void {
     const rect = canvas!.getBoundingClientRect();

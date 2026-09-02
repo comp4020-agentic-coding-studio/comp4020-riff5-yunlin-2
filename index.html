@@ -36,9 +36,15 @@
       <div id="stage-frame">
         <canvas id="stage" aria-label="Far Bank: a river with stepping stones, one figure at its edge.">
         </canvas>
-        <p id="score" aria-live="polite"></p>
       </div>
     </main>
+    <aside id="side-panel" aria-label="Score and run history">
+      <p id="score" aria-live="polite"></p>
+      <section id="history">
+        <h2>Recent runs</h2>
+        <ol id="history-list"></ol>
+      </section>
+    </aside>
     <script type="module" src="./main.ts"></script>
   </body>
 </html>

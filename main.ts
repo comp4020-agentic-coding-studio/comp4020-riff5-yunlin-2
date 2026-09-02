@@ -93,6 +93,14 @@ class FarBank {
   private gap: Gap = nextGap(0, Math.random, MAX_DISTANCE);
   private scrollOffset = 0;
 
+  /** The target stone drifts side to side once the score clears a small
+   *  grace period --- amplitude and speed both grow with score, so later
+   *  jumps demand releasing at the right moment as well as the right charge.
+   *  Re-rolled alongside the gap so each target gets its own drift. */
+  private padDriftAmplitude = 0;
+  private padDriftSpeed = 0;
+  private padDriftPhase = 0;
+
   private chargeStart = 0;
   private inputMode: "hold" | "drag" = "hold";
   private dragStartVirtualX = 0;
@@ -166,12 +174,30 @@ class FarBank {
       img.src = `./sprites/squirrel-${i + 1}.png`;
       this.sprites[i] = img;
     }
+    this.rerollGap(0);
     this.updateScoreText();
     this.renderHistory();
   }
 
   private duration(ms: number): number {
     return this.reducedMotion ? Math.min(ms, 60) : ms;
+  }
+
+  /** Re-rolls the target gap and its drift for the given score --- the first
+   *  couple of stones hold still so the player can learn the base mechanic
+   *  before movement is added on top of it. Skipped entirely under
+   *  prefers-reduced-motion. */
+  private rerollGap(score: number): void {
+    this.gap = nextGap(score, Math.random, MAX_DISTANCE);
+    this.padDriftAmplitude = this.reducedMotion || score < 3 ? 0 : Math.min(8 + (score - 3) * 2, 34);
+    this.padDriftSpeed = 0.0015 + Math.min(score * 0.00025, 0.004);
+    this.padDriftPhase = Math.random() * Math.PI * 2;
+  }
+
+  /** The target stone's current sideways offset from its nominal gap
+   *  distance --- a pure function of time, like the clouds and ripples. */
+  private targetDrift(now: number): number {
+    return this.padDriftAmplitude * Math.sin(now * this.padDriftSpeed + this.padDriftPhase);
   }
 
   private updateScoreText(): void {
@@ -243,7 +269,11 @@ class FarBank {
     if (this.phase !== "charging") return;
     const fraction = this.chargeFraction(now);
     this.jumpDistance = chargeToDistance(fraction * MAX_CHARGE_MS, MAX_CHARGE_MS, MAX_DISTANCE);
-    this.outcome = resolveJump(this.jumpDistance, this.gap);
+    // The target's drift at the moment of release is where it actually is
+    // --- resolveJump itself stays a pure function of a fixed gap, so the
+    // drift is folded into the distance passed in rather than that contract.
+    const driftedGap: Gap = { distance: this.gap.distance + this.targetDrift(now), stoneWidth: this.gap.stoneWidth };
+    this.outcome = resolveJump(this.jumpDistance, driftedGap);
     this.hopFrom = this.scrollOffset;
     this.hopStart = now;
     this.phase = "airborne";
@@ -264,7 +294,7 @@ class FarBank {
     this.score = 0;
     this.currentStoneWorldX = 0;
     this.currentStoneWidth = START_STONE_WIDTH;
-    this.gap = nextGap(0, Math.random, MAX_DISTANCE);
+    this.rerollGap(0);
     this.scrollOffset = 0;
     this.updateScoreText();
   }
@@ -275,7 +305,10 @@ class FarBank {
       this.scrollOffset = this.hopFrom + this.jumpDistance * easeInOutQuad(t);
       if (t >= 1) {
         if (this.outcome === "stone") {
-          const landedStoneWorldX = this.hopFrom + this.gap.distance;
+          // Land wherever the jump actually reached, not the gap's nominal
+          // centre --- with a drifting target those only match by luck, and
+          // the stone should come to rest right underfoot.
+          const landedStoneWorldX = this.hopFrom + this.jumpDistance;
           this.currentStoneWorldX = landedStoneWorldX;
           this.currentStoneWidth = this.gap.stoneWidth;
           this.score += 1;
@@ -283,7 +316,7 @@ class FarBank {
             this.best = this.score;
             saveBest(this.best);
           }
-          this.gap = nextGap(this.score, Math.random, MAX_DISTANCE);
+          this.rerollGap(this.score);
           this.settleFrom = this.scrollOffset;
           this.settleStart = now;
           this.phase = "settling";
@@ -366,9 +399,10 @@ class FarBank {
       }
     }
 
-    // stones
+    // stones --- the target one drifts (see targetDrift); the one already
+    // landed on stays put.
     this.drawStone(this.currentStoneWorldX, this.currentStoneWidth);
-    this.drawStone(this.currentStoneWorldX + this.gap.distance, this.gap.stoneWidth);
+    this.drawStone(this.currentStoneWorldX + this.gap.distance + this.targetDrift(now), this.gap.stoneWidth);
 
     // charge meter --- the single accent colour marks the moment of decision.
     // Sized to stay legible scaled down to the ~350px-wide mobile canvas,

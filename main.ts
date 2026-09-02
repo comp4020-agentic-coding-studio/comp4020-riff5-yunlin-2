@@ -1,7 +1,8 @@
-// Far Bank --- hold to charge a hop across the river, release to land it.
-// One mechanic: judge the hold. Land short or long and the round ends in the
-// water. The rules in game-logic.ts are the contract; everything here is
-// timing, drawing and input.
+// Far Bank --- press and drag (mouse/touch/pen) or hold (spacebar) to charge
+// a hop across the river, release to land it. One mechanic: judge the
+// charge. Land short or long and the round ends in the water. The rules in
+// game-logic.ts are the contract; everything here is timing, drawing and
+// input.
 import { chargeToDistance, nextGap, resolveJump, type Gap, type JumpOutcome } from "./game-logic.ts";
 
 const VW = 800;
@@ -10,11 +11,21 @@ const WATER_Y = 380;
 const PLAYER_X = 220;
 const MAX_CHARGE_MS = 900;
 const MAX_DISTANCE = 260;
+/** Drag distance, in virtual (canvas) units, that fills the charge meter.
+ *  Deliberately smaller than MAX_DISTANCE so a full charge is a comfortable
+ *  swipe rather than a drag across most of the board. */
+const DRAG_RANGE = 180;
 const JUMP_MS = 380;
 const SETTLE_MS = 160;
 const SPLASH_MS = 550;
 const START_STONE_WIDTH = 74;
 const BEST_KEY = "far-bank-best";
+const SPRITE_COUNT = 9;
+/** Frame index (1-based, into squirrel-N.png) for each phase. A single held
+ *  pose for the hop reads as a jump; cycling frames mid-arc looked like a
+ *  running loop stuck in place instead of one leap across the gap. */
+const IDLE_FRAME = 1;
+const JUMP_FRAME = 3;
 
 type Phase = "ready" | "charging" | "airborne" | "settling" | "splash" | "gameover";
 
@@ -60,6 +71,9 @@ class FarBank {
   private scrollOffset = 0;
 
   private chargeStart = 0;
+  private inputMode: "hold" | "drag" = "hold";
+  private dragStartVirtualX = 0;
+  private dragChargeFraction = 0;
   private hopStart = 0;
   private hopFrom = 0;
   private jumpDistance = 0;
@@ -67,6 +81,43 @@ class FarBank {
   private settleStart = 0;
   private settleFrom = 0;
   private splashStart = 0;
+
+  /** The supplied landscape photo, drawn cover-fit behind the water --- a
+   *  static backdrop, unlike the drifting clouds it replaces. Drawing waits
+   *  on `backgroundLoaded` so a slow first load shows the plain sky colour
+   *  instead of a half-drawn image. */
+  private readonly background = new Image();
+  private backgroundLoaded = false;
+
+  /** Squirrel running-cycle frames, cut from a hand-drawn sprite sheet.
+   *  Frame 1 is the standing/idle pose; 2 onward run through a leap. Each
+   *  loads independently --- `spritesLoaded[i]` gates drawing that one frame
+   *  so a slow load never shows a blank/broken image mid-jump. */
+  private readonly sprites: HTMLImageElement[] = [];
+  private readonly spritesLoaded: boolean[] = [];
+
+  /** Ambient ripples, each a pure function of time --- no per-frame state to
+   *  track. `offset` staggers them so they don't all pulse in lockstep;
+   *  `period` is how long one expand-and-fade cycle takes. */
+  /** Drawn over the (static) background photo so the sky still reads as
+   *  moving air --- fixed screen positions, wrapped across a band wider
+   *  than the canvas so a cloud leaving one edge is already entering the
+   *  other. Reduced-motion holds them at their base position. */
+  private readonly clouds = [
+    { baseX: 90, y: 65, scale: 1.1, speed: 0.012 },
+    { baseX: 340, y: 40, scale: 0.75, speed: 0.008 },
+    { baseX: 560, y: 95, scale: 1.3, speed: 0.006 },
+    { baseX: 730, y: 55, scale: 0.9, speed: 0.01 },
+  ];
+
+  private readonly ripples = [
+    { x: 110, y: 425, period: 2600, offset: 0 },
+    { x: 250, y: 465, period: 3100, offset: 900 },
+    { x: 400, y: 435, period: 2800, offset: 1800 },
+    { x: 540, y: 500, period: 3400, offset: 400 },
+    { x: 660, y: 455, period: 2900, offset: 2200 },
+    { x: 320, y: 545, period: 3600, offset: 1200 },
+  ];
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -77,6 +128,19 @@ class FarBank {
     this.ctx = ctx;
     this.scoreEl = scoreEl;
     this.reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    this.background.addEventListener("load", () => {
+      this.backgroundLoaded = true;
+    });
+    this.background.src = "./background.jpg";
+    for (let i = 0; i < SPRITE_COUNT; i++) {
+      const img = new Image();
+      this.spritesLoaded[i] = false;
+      img.addEventListener("load", () => {
+        this.spritesLoaded[i] = true;
+      });
+      img.src = `./sprites/squirrel-${i + 1}.png`;
+      this.sprites[i] = img;
+    }
     this.updateScoreText();
   }
 
@@ -91,17 +155,43 @@ class FarBank {
         : `Score ${this.score}`;
   }
 
-  press(now: number): void {
+  /** `virtualX` is the press point in canvas (virtual) units --- present for
+   *  a pointer press, absent for a keyboard (spacebar) press. Its presence
+   *  picks the charge mode: a pointer press charges by drag distance in
+   *  either direction (see `drag`); a keyboard press falls back to the
+   *  original hold-duration charge, since there's no cursor position to
+   *  drag from. */
+  press(now: number, virtualX?: number): void {
     if (this.phase === "gameover") this.reset();
     if (this.phase !== "ready") return;
     this.phase = "charging";
     this.chargeStart = now;
+    if (virtualX === undefined) {
+      this.inputMode = "hold";
+    } else {
+      this.inputMode = "drag";
+      this.dragStartVirtualX = virtualX;
+      this.dragChargeFraction = 0;
+    }
+  }
+
+  /** Distance from the press point, either direction, fills the meter ---
+   *  dragging left and dragging right are equally valid ways to charge. */
+  drag(virtualX: number): void {
+    if (this.phase !== "charging" || this.inputMode !== "drag") return;
+    const dragged = Math.abs(virtualX - this.dragStartVirtualX);
+    this.dragChargeFraction = Math.min(dragged / DRAG_RANGE, 1);
+  }
+
+  private chargeFraction(now: number): number {
+    if (this.inputMode === "drag") return this.dragChargeFraction;
+    return Math.min((now - this.chargeStart) / MAX_CHARGE_MS, 1);
   }
 
   release(now: number): void {
     if (this.phase !== "charging") return;
-    const held = now - this.chargeStart;
-    this.jumpDistance = chargeToDistance(held, MAX_CHARGE_MS, MAX_DISTANCE);
+    const fraction = this.chargeFraction(now);
+    this.jumpDistance = chargeToDistance(fraction * MAX_CHARGE_MS, MAX_CHARGE_MS, MAX_DISTANCE);
     this.outcome = resolveJump(this.jumpDistance, this.gap);
     this.hopFrom = this.scrollOffset;
     this.hopStart = now;
@@ -173,42 +263,30 @@ class FarBank {
     const ctx = this.ctx;
     ctx.clearRect(0, 0, VW, VH);
 
-    ctx.fillStyle = "#f3efe4";
-    ctx.fillRect(0, 0, VW, VH);
-
-    // Ni Zan style far bank: a sparse ridge and two bare strokes for trees ---
-    // drawn once per frame, at a fixed screen position, never resolvable by
-    // crossing --- the far bank recedes exactly as fast as you approach it.
-    ctx.fillStyle = "rgba(107, 102, 92, 0.35)";
-    ctx.beginPath();
-    ctx.moveTo(0, 170);
-    ctx.lineTo(140, 100);
-    ctx.lineTo(260, 150);
-    ctx.lineTo(430, 90);
-    ctx.lineTo(620, 145);
-    ctx.lineTo(VW, 115);
-    ctx.lineTo(VW, WATER_Y);
-    ctx.lineTo(0, WATER_Y);
-    ctx.closePath();
-    ctx.fill();
-
-    ctx.strokeStyle = "rgba(36, 33, 29, 0.55)";
-    ctx.lineWidth = 2;
-    for (const x of [95, 560]) {
-      ctx.beginPath();
-      ctx.moveTo(x, WATER_Y - 4);
-      ctx.lineTo(x - 6, WATER_Y - 60);
-      ctx.moveTo(x - 6, WATER_Y - 60);
-      ctx.lineTo(x - 22, WATER_Y - 70);
-      ctx.moveTo(x - 6, WATER_Y - 50);
-      ctx.lineTo(x + 14, WATER_Y - 62);
-      ctx.stroke();
+    if (this.backgroundLoaded) {
+      // Cover-fit the photo into the band above the waterline: scale by
+      // width (the limiting dimension for this image against this band's
+      // aspect ratio) and crop the source vertically around its centre, so
+      // the mountains fill the width with no letterboxing or distortion.
+      const scale = VW / this.background.naturalWidth;
+      const sourceHeight = WATER_Y / scale;
+      const sourceY = (this.background.naturalHeight - sourceHeight) / 2;
+      ctx.drawImage(this.background, 0, sourceY, this.background.naturalWidth, sourceHeight, 0, 0, VW, WATER_Y);
+    } else {
+      ctx.fillStyle = "#8ec3e0";
+      ctx.fillRect(0, 0, VW, WATER_Y);
     }
 
-    // water
-    ctx.fillStyle = "rgba(107, 102, 92, 0.18)";
+    for (const cloud of this.clouds) {
+      const x = this.reducedMotion ? cloud.baseX : ((cloud.baseX + now * cloud.speed) % (VW + 160)) - 80;
+      this.drawCloud(x, cloud.y, cloud.scale);
+    }
+
+    // water --- tinted to reflect the sky above it rather than the old
+    // monochrome wash.
+    ctx.fillStyle = "rgba(93, 133, 158, 0.25)";
     ctx.fillRect(0, WATER_Y, VW, VH - WATER_Y);
-    ctx.strokeStyle = "rgba(107, 102, 92, 0.4)";
+    ctx.strokeStyle = "rgba(72, 110, 133, 0.45)";
     ctx.lineWidth = 1.5;
     const drift = (now / 900) % (2 * Math.PI);
     for (let row = 0; row < 4; row++) {
@@ -222,6 +300,20 @@ class FarBank {
       ctx.stroke();
     }
 
+    // ripples --- skipped under prefers-reduced-motion, since an expanding
+    // ring is motion with nothing else to offer.
+    if (!this.reducedMotion) {
+      for (const ripple of this.ripples) {
+        const phase = (((now + ripple.offset) % ripple.period) + ripple.period) % ripple.period / ripple.period;
+        const radius = 6 + phase * 34;
+        ctx.strokeStyle = `rgba(255, 255, 255, ${(1 - phase) * 0.35})`;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.ellipse(ripple.x, ripple.y, radius, radius * 0.35, 0, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+
     // stones
     this.drawStone(this.currentStoneWorldX, this.currentStoneWidth);
     this.drawStone(this.currentStoneWorldX + this.gap.distance, this.gap.stoneWidth);
@@ -231,7 +323,7 @@ class FarBank {
     // where a smaller bar (found by playing at that viewport) read as a
     // barely-visible sliver.
     if (this.phase === "charging") {
-      const t = Math.min((now - this.chargeStart) / MAX_CHARGE_MS, 1);
+      const t = this.chargeFraction(now);
       const barWidth = 70;
       const barHeight = 16;
       const barX = PLAYER_X - barWidth / 2;
@@ -260,31 +352,68 @@ class FarBank {
     }
   }
 
+  private drawCloud(x: number, y: number, scale: number): void {
+    const ctx = this.ctx;
+    ctx.fillStyle = "rgba(255, 255, 255, 0.85)";
+    ctx.beginPath();
+    ctx.ellipse(x, y, 26 * scale, 13 * scale, 0, 0, Math.PI * 2);
+    ctx.ellipse(x - 20 * scale, y + 5 * scale, 18 * scale, 10 * scale, 0, 0, Math.PI * 2);
+    ctx.ellipse(x + 22 * scale, y + 4 * scale, 20 * scale, 11 * scale, 0, 0, Math.PI * 2);
+    ctx.ellipse(x + 4 * scale, y - 8 * scale, 16 * scale, 9 * scale, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
   private drawStone(worldX: number, width: number): void {
     const x = this.worldToScreen(worldX);
     if (x < -width || x > VW + width) return;
     const ctx = this.ctx;
-    ctx.fillStyle = "#24211d";
+    const rx = width / 2;
+    const ry = 16;
+    // The classic lily-pad notch: a wedge cut from the disc, pointing
+    // outward so it doesn't fall on the spot the player actually lands.
+    const notchAngle = Math.PI / 2;
+    const notchWidth = 0.5;
+
+    ctx.fillStyle = "#3f6b3a";
+    ctx.save();
+    ctx.translate(x, WATER_Y);
+    ctx.scale(rx, ry);
     ctx.beginPath();
-    ctx.ellipse(x, WATER_Y, width / 2, 16, 0, 0, Math.PI * 2);
+    ctx.arc(0, 0, 1, notchAngle + notchWidth / 2, notchAngle - notchWidth / 2 + Math.PI * 2);
+    ctx.lineTo(0, 0);
+    ctx.closePath();
     ctx.fill();
-    ctx.fillStyle = "rgba(255, 255, 255, 0.12)";
+    ctx.restore();
+
+    ctx.strokeStyle = "rgba(36, 58, 30, 0.5)";
+    ctx.lineWidth = 1;
+    for (const a of [-0.9, -0.3, 0.3, 0.9]) {
+      ctx.beginPath();
+      ctx.moveTo(x, WATER_Y);
+      ctx.lineTo(x + Math.cos(a) * rx * 0.85, WATER_Y + Math.sin(a) * ry * 0.85);
+      ctx.stroke();
+    }
+
+    ctx.fillStyle = "rgba(255, 255, 255, 0.18)";
     ctx.beginPath();
-    ctx.ellipse(x - width / 6, WATER_Y - 5, width / 4, 6, 0, 0, Math.PI * 2);
+    ctx.ellipse(x - width / 6, WATER_Y - 5, width / 5, 5, 0, 0, Math.PI * 2);
     ctx.fill();
   }
 
   private drawPlayer(now: number): void {
     const ctx = this.ctx;
     let y = WATER_Y - 20;
+    let frameIndex = IDLE_FRAME;
 
     if (this.phase === "airborne") {
       const t = Math.min((now - this.hopStart) / this.duration(JUMP_MS), 1);
       y -= Math.sin(Math.PI * t) * 70;
+      frameIndex = JUMP_FRAME;
     } else if (this.phase === "splash") {
       const t = Math.min((now - this.splashStart) / this.duration(SPLASH_MS), 1);
       y = WATER_Y - 20 + t * 26;
       ctx.globalAlpha = Math.max(1 - t * 1.3, 0);
+      frameIndex = JUMP_FRAME;
     } else if (this.phase === "gameover") {
       return;
     }
@@ -292,10 +421,17 @@ class FarBank {
     // The camera always recentres on the player's own trajectory (see
     // worldToScreen), so the player is drawn at a fixed screen x in every
     // phase --- it's the stones that visibly slide short or long of it.
-    ctx.fillStyle = "#24211d";
-    ctx.beginPath();
-    ctx.ellipse(PLAYER_X, y, 12, 14, 0, 0, Math.PI * 2);
-    ctx.fill();
+    const sprite = this.sprites[frameIndex - 1];
+    if (sprite && this.spritesLoaded[frameIndex - 1]) {
+      const drawHeight = 56;
+      const drawWidth = drawHeight * (sprite.naturalWidth / sprite.naturalHeight);
+      ctx.drawImage(sprite, PLAYER_X - drawWidth / 2, y + 14 - drawHeight, drawWidth, drawHeight);
+    } else {
+      ctx.fillStyle = "#24211d";
+      ctx.beginPath();
+      ctx.ellipse(PLAYER_X, y, 12, 14, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
     ctx.globalAlpha = 1;
   }
 }
@@ -349,6 +485,15 @@ function main(): void {
 
   let activePointerId: number | null = null;
 
+  /** Converts a client-space pointer coordinate to the same virtual x-axis
+   *  the game logic works in --- the canvas's CSS box scales uniformly with
+   *  its 4:3 backing store (see styles.css), so a plain width ratio is
+   *  enough; no need to account for devicePixelRatio or letterboxing. */
+  function virtualXFromEvent(event: PointerEvent): number {
+    const rect = canvas!.getBoundingClientRect();
+    return ((event.clientX - rect.left) / rect.width) * VW;
+  }
+
   /** A right-click's `contextmenu` reliably reaches the page, but whether the
    *  native menu it opens fires `blur` first is inconsistent across browsers
    *  and platforms --- so the existing blur-cancels-a-stuck-charge safety net
@@ -362,7 +507,11 @@ function main(): void {
     if (activePointerId !== null || event.button !== 0) return;
     activePointerId = event.pointerId;
     event.preventDefault();
-    game.press(performance.now());
+    game.press(performance.now(), virtualXFromEvent(event));
+  });
+  window.addEventListener("pointermove", (event) => {
+    if (event.pointerId !== activePointerId) return;
+    game.drag(virtualXFromEvent(event));
   });
   const endPointer = (event: PointerEvent): void => {
     if (event.pointerId !== activePointerId) return;
